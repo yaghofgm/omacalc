@@ -5,7 +5,6 @@
 #include <QDir>
 #include <QFile>
 #include <QGuiApplication>
-#include <QLocale>
 #include <QRect>
 #include <QSettings>
 #include <QTextStream>
@@ -14,26 +13,16 @@
 
 namespace {
 const auto windowGeometrySetting = QStringLiteral("window/geometry");
+constexpr int historyLimit = 200;
 
-const QString plusSign = QStringLiteral("+");
-const QString minusSign = QStringLiteral("−");
-const QString multiplySign = QStringLiteral("×");
-const QString divideSign = QStringLiteral("÷");
-
-bool isOperator(const QString &token) {
-    return token == plusSign || token == minusSign
-        || token == multiplySign || token == divideSign;
+QString complexToString(const Complex &value) {
+    return QString::number(value.real(), 'g', 17) + QLatin1Char(',')
+        + QString::number(value.imag(), 'g', 17);
 }
 
-// Digits are entered raw, so "5." and "-" can linger while typing. Seal them
-// into plain numbers before they join the expression.
-QString sealNumber(const QString &entry) {
-    QString sealed = entry;
-    if (sealed.endsWith(QLatin1Char('.')))
-        sealed.chop(1);
-    if (sealed.isEmpty() || sealed == QStringLiteral("-"))
-        return QStringLiteral("0");
-    return sealed;
+Complex complexFromString(const QString &text) {
+    const QStringList parts = text.split(QLatin1Char(','));
+    return Complex(parts.value(0).toDouble(), parts.value(1).toDouble());
 }
 }
 
@@ -48,349 +37,337 @@ Backend::Backend(QObject *parent) : QObject(parent) {
         loadOmarchyTheme();
         watchOmarchyTheme();
     });
+    loadState();
+    refresh();
 }
 
-QString Backend::expression() const {
-    if (m_errored || m_justEvaluated)
-        return m_evaluatedExpression;
-    return prettyExpression(m_tokens);
+void Backend::setInput(const QString &input) {
+    if (m_input == input)
+        return;
+    m_input = input;
+    refresh();
 }
 
-QString Backend::display() const {
-    if (m_errored)
-        return QStringLiteral("Error");
-    if (!m_entry.isEmpty())
-        return m_entry;
-    if (m_justEvaluated)
-        return m_result;
-    return formatNumber(QLocale::c().toDouble(currentValue()));
-}
+// Recomputes everything derived from the input: while typing the display
+// previews the result without committing it; with no input it shows ans.
+void Backend::refresh() {
+    m_status.clear();
+    m_alternate.clear();
 
-// Operand tokens carry full round-trip precision when they come from a chained
-// result; present every number at display precision instead.
-QString Backend::prettyExpression(const QStringList &tokens) {
-    QStringList pretty;
-    pretty.reserve(tokens.size());
-    for (const QString &token : tokens)
-        pretty << (isOperator(token) ? token
-                                     : formatNumber(QLocale::c().toDouble(token)));
-    return pretty.join(QLatin1Char(' '));
-}
-
-// The number the calculator is "at" right now: the entry being typed, or the
-// operand the last operator was applied to, or the fresh-start zero.
-QString Backend::currentValue() const {
-    if (!m_entry.isEmpty())
-        return sealNumber(m_entry);
-    for (int i = m_tokens.size() - 1; i >= 0; --i) {
-        if (!isOperator(m_tokens.at(i)))
-            return m_tokens.at(i);
-    }
-    return QStringLiteral("0");
-}
-
-void Backend::pressKey(const QString &key) {
-    if (key.size() == 1 && key.at(0).isDigit()) {
-        pressDigit(key);
-    } else if (key == QStringLiteral(".")) {
-        pressDecimal();
-    } else if (key == QStringLiteral("+")) {
-        pressOperator(plusSign);
-    } else if (key == QStringLiteral("-") || key == minusSign) {
-        pressOperator(minusSign);
-    } else if (key == QStringLiteral("*") || key == multiplySign) {
-        pressOperator(multiplySign);
-    } else if (key == QStringLiteral("/") || key == divideSign) {
-        pressOperator(divideSign);
-    } else if (key == QStringLiteral("=")) {
-        pressEquals();
-    } else if (key == QStringLiteral("%")) {
-        pressPercent();
-    } else if (key == QStringLiteral("sign")) {
-        pressToggleSign();
-    } else if (key == QStringLiteral("backspace")) {
-        pressBackspace();
-    } else if (key == QStringLiteral("clear")) {
-        pressClear();
-    } else {
+    if (m_input.trimmed().isEmpty()) {
+        m_lastPreview.clear();
+        m_displayIsPreview = false;
+        m_display = Format::value(m_engine.ans, m_options);
+        if (!m_history.isEmpty() && m_history.last().definedFunction.isEmpty())
+            m_alternate = Format::alternate(m_engine.ans, m_options);
+        emit calculationChanged();
         return;
     }
 
+    m_displayIsPreview = true;
+    const Engine::Result result = m_engine.evaluate(m_input, false);
+    if (result.ok && result.definedFunction) {
+        m_display = m_lastPreview = result.assignedName + QStringLiteral("(…)");
+        m_status = QStringLiteral("Enter defines %1").arg(result.assignedName);
+    } else if (result.ok) {
+        m_display = m_lastPreview = Format::value(result.value, m_options);
+        m_alternate = Format::alternate(result.value, m_options);
+        if (!result.assignedName.isEmpty())
+            m_status = QStringLiteral("Enter stores %1").arg(result.assignedName);
+    } else {
+        // Keep the last good preview on screen while the expression is
+        // momentarily incomplete, and say what is wrong underneath.
+        m_display = m_lastPreview;
+        m_status = result.error;
+    }
     emit calculationChanged();
 }
 
-void Backend::pressDigit(const QString &digit) {
-    if (m_errored)
-        pressClear();
-    if (m_justEvaluated) {
-        // A digit after equals starts a new calculation rather than
-        // appending to the result.
-        pressClear();
+bool Backend::evaluate() {
+    if (m_input.trimmed().isEmpty())
+        return false;
+
+    const Engine::Result result = m_engine.evaluate(m_input, true);
+    if (!result.ok) {
+        m_status = result.error.isEmpty() ? QStringLiteral("Nothing to calculate") : result.error;
+        emit calculationChanged();
+        return false;
     }
 
-    if (m_entry == QStringLiteral("0")) {
-        m_entry = digit;
-        return;
-    }
-    if (m_entry == QStringLiteral("-0")) {
-        m_entry = QStringLiteral("-") + digit;
-        return;
-    }
+    HistoryEntry entry;
+    entry.expression = m_input.trimmed();
+    // The engine closes dangling parentheses; show them closed in history.
+    const int unclosed = entry.expression.count(QLatin1Char('('))
+        - entry.expression.count(QLatin1Char(')'));
+    if (unclosed > 0)
+        entry.expression += QString(unclosed, QLatin1Char(')'));
+    entry.value = result.value;
+    if (result.definedFunction)
+        entry.definedFunction = result.assignedName;
+    m_history << entry;
+    while (m_history.size() > historyLimit)
+        m_history.removeFirst();
 
-    // Fifteen significant digits is what the display format preserves; letting
-    // the entry grow beyond that would silently round what was typed. The
-    // zero in a leading "0." is not significant, so it does not count.
-    int digits = 0;
-    for (const QChar character : m_entry) {
-        if (character.isDigit())
-            ++digits;
-    }
-    if (m_entry.startsWith(QStringLiteral("0."))
-            || m_entry.startsWith(QStringLiteral("-0.")))
-        --digits;
-    if (digits < 15)
-        m_entry += digit;
+    m_input.clear();
+    m_lastPreview.clear();
+    refresh();
+    if (result.definedFunction)
+        m_display = QStringLiteral("Defined %1").arg(result.assignedName);
+    emit calculationChanged();
+    emit historyChanged();
+    saveState();
+    return true;
 }
 
-void Backend::pressDecimal() {
-    if (m_errored)
-        pressClear();
-    if (m_justEvaluated)
-        pressClear();
-
-    if (m_entry.isEmpty())
-        m_entry = QStringLiteral("0.");
-    else if (!m_entry.contains(QLatin1Char('.')))
-        m_entry += QLatin1Char('.');
+QString Backend::formatEntry(const HistoryEntry &entry) const {
+    if (!entry.definedFunction.isEmpty())
+        return QStringLiteral("defined");
+    return Format::value(entry.value, m_options);
 }
 
-void Backend::pressOperator(const QString &pretty) {
-    if (m_errored)
-        return;
-
-    if (m_justEvaluated) {
-        // Chain from the exact result value, not its rounded display text, so
-        // 1 ÷ 3 = × 3 comes back as 1. Seventeen significant digits round-trip
-        // any double; the expression line re-rounds them for presentation.
-        m_tokens = QStringList(QString::number(m_resultValue, 'g', 17));
-        clearEvaluation();
+QVariantList Backend::history() const {
+    QVariantList list;
+    list.reserve(m_history.size());
+    for (const HistoryEntry &entry : m_history) {
+        QVariantMap map;
+        map.insert(QStringLiteral("expression"), entry.expression);
+        map.insert(QStringLiteral("result"), formatEntry(entry));
+        list << map;
     }
+    return list;
+}
 
-    if (!m_entry.isEmpty()) {
-        m_tokens << sealNumber(m_entry) << pretty;
-        m_entry.clear();
-    } else if (m_tokens.isEmpty()) {
-        m_tokens << QStringLiteral("0") << pretty;
-    } else if (isOperator(m_tokens.last())) {
-        m_tokens.last() = pretty;
-    } else {
-        m_tokens << pretty;
+QVariantList Backend::userDefinitions() const {
+    QVariantList list;
+    for (auto it = m_engine.variables.cbegin(); it != m_engine.variables.cend(); ++it) {
+        QVariantMap map;
+        map.insert(QStringLiteral("name"), it.key());
+        map.insert(QStringLiteral("description"), Format::value(it.value(), m_options));
+        list << map;
+    }
+    for (auto it = m_engine.functions.cbegin(); it != m_engine.functions.cend(); ++it) {
+        QVariantMap map;
+        map.insert(QStringLiteral("name"),
+                   it.key() + QLatin1Char('(') + it.value().parameters.join(QStringLiteral(", "))
+                       + QLatin1Char(')'));
+        map.insert(QStringLiteral("description"), it.value().body);
+        list << map;
+    }
+    return list;
+}
+
+QVariantList Backend::functionReference() const {
+    QVariantList list;
+    for (const auto &item : Engine::functionReference()) {
+        QVariantMap map;
+        map.insert(QStringLiteral("name"), item.first);
+        map.insert(QStringLiteral("description"), item.second);
+        list << map;
+    }
+    return list;
+}
+
+QVariantList Backend::constantReference() const {
+    QVariantList list;
+    Format::Options options;
+    for (const auto &item : Engine::constantReference()) {
+        Complex value;
+        Engine::constantValue(item.first, &value);
+        QVariantMap map;
+        map.insert(QStringLiteral("name"), item.first);
+        map.insert(QStringLiteral("description"), item.second);
+        map.insert(QStringLiteral("value"), Format::value(value, options));
+        list << map;
+    }
+    return list;
+}
+
+void Backend::clearHistory() {
+    m_history.clear();
+    m_engine.ans = 0;
+    refresh();
+    emit historyChanged();
+    saveState();
+}
+
+void Backend::forgetDefinitions() {
+    m_engine.variables.clear();
+    m_engine.functions.clear();
+    refresh();
+    emit historyChanged();
+    saveState();
+}
+
+QString Backend::angleMode() const {
+    return m_engine.angleUnit == Engine::AngleUnit::Degrees ? QStringLiteral("deg")
+                                                            : QStringLiteral("rad");
+}
+
+void Backend::setAngleMode(const QString &mode) {
+    const auto unit = mode == QStringLiteral("deg") ? Engine::AngleUnit::Degrees
+                                                    : Engine::AngleUnit::Radians;
+    if (unit == m_engine.angleUnit)
+        return;
+    m_engine.angleUnit = unit;
+    m_options.angleUnit = unit;
+    saveModes();
+    emit modesChanged();
+    emit historyChanged();
+    refresh();
+}
+
+QString Backend::notation() const {
+    switch (m_options.notation) {
+    case Format::Notation::Scientific: return QStringLiteral("sci");
+    case Format::Notation::Engineering: return QStringLiteral("eng");
+    default: return QStringLiteral("norm");
     }
 }
 
-void Backend::pressEquals() {
-    if (m_errored || m_justEvaluated)
+void Backend::setNotation(const QString &notation) {
+    Format::Notation value = Format::Notation::Normal;
+    if (notation == QStringLiteral("sci"))
+        value = Format::Notation::Scientific;
+    else if (notation == QStringLiteral("eng"))
+        value = Format::Notation::Engineering;
+    if (value == m_options.notation)
         return;
+    m_options.notation = value;
+    saveModes();
+    emit modesChanged();
+    emit historyChanged();
+    refresh();
+}
 
-    QStringList finalTokens = m_tokens;
-    if (!m_entry.isEmpty())
-        finalTokens << sealNumber(m_entry);
-    while (!finalTokens.isEmpty() && isOperator(finalTokens.last()))
-        finalTokens.removeLast();
-    if (finalTokens.isEmpty())
-        return;
-
-    m_evaluatedExpression = prettyExpression(finalTokens);
-    bool ok = false;
-    const double value = evaluateTokens(finalTokens, &ok);
-    if (!ok) {
-        m_errored = true;
-    } else {
-        m_resultValue = value;
-        m_result = formatNumber(value);
-        m_justEvaluated = true;
+QString Backend::base() const {
+    switch (m_options.base) {
+    case Format::Base::Hexadecimal: return QStringLiteral("hex");
+    case Format::Base::Binary: return QStringLiteral("bin");
+    case Format::Base::Octal: return QStringLiteral("oct");
+    default: return QStringLiteral("dec");
     }
-    m_tokens.clear();
-    m_entry.clear();
 }
 
-// iOS-style percent: with a pending + or −, x% means x percent of the running
-// total, so 200 + 10 % = gives 220. With × or ÷ (or on its own) x% is simply
-// x ÷ 100, so 200 × 10 % = gives 20.
-void Backend::pressPercent() {
-    if (m_errored)
+void Backend::setBase(const QString &base) {
+    Format::Base value = Format::Base::Decimal;
+    if (base == QStringLiteral("hex"))
+        value = Format::Base::Hexadecimal;
+    else if (base == QStringLiteral("bin"))
+        value = Format::Base::Binary;
+    else if (base == QStringLiteral("oct"))
+        value = Format::Base::Octal;
+    if (value == m_options.base)
         return;
+    m_options.base = value;
+    saveModes();
+    emit modesChanged();
+    emit historyChanged();
+    refresh();
+}
 
-    if (m_justEvaluated) {
-        const double percent = m_resultValue / 100.0;
-        clearEvaluation();
-        m_entry = formatNumber(percent);
+void Backend::setPolar(bool polar) {
+    if (polar == m_options.polar)
         return;
-    }
-
-    bool ok = false;
-    const double value = QLocale::c().toDouble(currentValue(), &ok);
-    if (!ok)
-        return;
-
-    double percent = value / 100.0;
-    if (!m_tokens.isEmpty() && (m_tokens.last() == plusSign || m_tokens.last() == minusSign)) {
-        QStringList leftSide = m_tokens;
-        leftSide.removeLast();
-        bool baseOk = false;
-        const double base = evaluateTokens(leftSide, &baseOk);
-        if (baseOk)
-            percent = base * value / 100.0;
-    }
-    m_entry = formatNumber(percent);
-}
-
-void Backend::pressToggleSign() {
-    if (m_errored)
-        return;
-    if (m_justEvaluated)
-        beginEditingAfterResult();
-
-    // With nothing typed yet, start a fresh negative operand instead of
-    // dredging up the previous one: 4 + ± 2 enters -2, not -42.
-    if (m_entry.isEmpty()) {
-        m_entry = QStringLiteral("-0");
-        return;
-    }
-
-    if (m_entry.startsWith(QLatin1Char('-')))
-        m_entry.remove(0, 1);
-    else
-        m_entry.prepend(QLatin1Char('-'));
-}
-
-void Backend::pressBackspace() {
-    if (m_errored) {
-        pressClear();
-        return;
-    }
-    if (m_justEvaluated)
-        beginEditingAfterResult();
-
-    m_entry.chop(1);
-    if (m_entry == QStringLiteral("-"))
-        m_entry.clear();
-}
-
-void Backend::pressClear() {
-    m_tokens.clear();
-    m_entry.clear();
-    clearEvaluation();
-    m_errored = false;
-}
-
-// Editing after equals picks up from the result's displayed digits, with the
-// old expression cleared away so the new one grows from "42" rather than
-// "42 × 3 + 7".
-void Backend::beginEditingAfterResult() {
-    m_entry = m_result;
-    m_tokens.clear();
-    clearEvaluation();
-}
-
-void Backend::clearEvaluation() {
-    m_result.clear();
-    m_resultValue = 0;
-    m_evaluatedExpression.clear();
-    m_justEvaluated = false;
-}
-
-double Backend::evaluateTokens(const QStringList &tokens, bool *ok) {
-    bool localOk = false;
-    if (!ok)
-        ok = &localOk;
-
-    *ok = false;
-    if (tokens.size() % 2 == 0)
-        return 0;
-
-    // First fold × and ÷ into their neighbors, then sum what remains, giving
-    // multiplication its usual precedence over addition.
-    QList<double> values;
-    QStringList additiveOperators;
-
-    bool numberOk = false;
-    values << QLocale::c().toDouble(tokens.first(), &numberOk);
-    if (!numberOk)
-        return 0;
-
-    for (int i = 1; i + 1 < tokens.size(); i += 2) {
-        const QString &op = tokens.at(i);
-        const double operand = QLocale::c().toDouble(tokens.at(i + 1), &numberOk);
-        if (!numberOk || !isOperator(op))
-            return 0;
-
-        if (op == multiplySign) {
-            values.last() *= operand;
-        } else if (op == divideSign) {
-            values.last() /= operand;
-        } else {
-            additiveOperators << op;
-            values << operand;
-        }
-    }
-
-    double total = values.first();
-    for (int i = 0; i < additiveOperators.size(); ++i) {
-        if (additiveOperators.at(i) == plusSign)
-            total += values.at(i + 1);
-        else
-            total -= values.at(i + 1);
-    }
-
-    if (!std::isfinite(total))
-        return 0;
-
-    *ok = true;
-    return total;
-}
-
-QString Backend::formatNumber(double value) {
-    if (value == 0)
-        value = 0;  // Collapse negative zero.
-
-    // Fifteen significant digits keeps binary-float noise like
-    // 0.1 + 0.2 = 0.30000000000000004 out of the display while showing
-    // every integer the 15-digit entry limit can produce exactly; larger
-    // magnitudes fall back to scientific notation.
-    return QString::number(value, 'g', 15);
+    m_options.polar = polar;
+    saveModes();
+    emit modesChanged();
+    emit historyChanged();
+    refresh();
 }
 
 void Backend::copyResult() const {
-    if (QClipboard *clipboard = QGuiApplication::clipboard())
-        clipboard->setText(display());
+    copyText(m_display);
 }
 
-// Paste replaces the current entry when the clipboard holds a number,
-// tolerating surrounding whitespace, a decimal comma, and the typographic
-// minus this calculator itself puts in expressions.
-void Backend::pasteNumber() {
-    const QClipboard *clipboard = QGuiApplication::clipboard();
-    if (!clipboard)
-        return;
+void Backend::copyText(const QString &text) const {
+    if (QClipboard *clipboard = QGuiApplication::clipboard())
+        clipboard->setText(text);
+}
 
-    QString text = clipboard->text().trimmed();
-    text.replace(minusSign, QStringLiteral("-"));
-    text.remove(QLatin1Char(' '));
+void Backend::loadState() {
+    QSettings settings;
+    settings.beginGroup(QStringLiteral("calculator"));
+    const bool degrees = settings.value(QStringLiteral("angle")).toString() == QStringLiteral("deg");
+    m_engine.angleUnit = degrees ? Engine::AngleUnit::Degrees : Engine::AngleUnit::Radians;
+    m_options.angleUnit = m_engine.angleUnit;
+    const QString notation = settings.value(QStringLiteral("notation")).toString();
+    m_options.notation = notation == QStringLiteral("sci") ? Format::Notation::Scientific
+        : notation == QStringLiteral("eng") ? Format::Notation::Engineering
+                                            : Format::Notation::Normal;
+    const QString base = settings.value(QStringLiteral("base")).toString();
+    m_options.base = base == QStringLiteral("hex") ? Format::Base::Hexadecimal
+        : base == QStringLiteral("bin") ? Format::Base::Binary
+        : base == QStringLiteral("oct") ? Format::Base::Octal
+                                        : Format::Base::Decimal;
+    m_options.polar = settings.value(QStringLiteral("polar"), false).toBool();
+    m_engine.ans = complexFromString(settings.value(QStringLiteral("ans")).toString());
 
-    bool ok = false;
-    double value = QLocale::c().toDouble(text, &ok);
-    if (!ok) {
-        text.replace(QLatin1Char(','), QLatin1Char('.'));
-        value = QLocale::c().toDouble(text, &ok);
+    const QVariantMap variables = settings.value(QStringLiteral("variables")).toMap();
+    for (auto it = variables.cbegin(); it != variables.cend(); ++it) {
+        if (!Engine::isReserved(it.key()))
+            m_engine.variables.insert(it.key(), complexFromString(it.value().toString()));
     }
-    if (!ok || !std::isfinite(value))
-        return;
+    const QVariantMap functions = settings.value(QStringLiteral("functions")).toMap();
+    for (auto it = functions.cbegin(); it != functions.cend(); ++it) {
+        const QStringList parts = it.value().toStringList();
+        if (parts.size() != 2 || Engine::isReserved(it.key()))
+            continue;
+        Engine::UserFunction function;
+        function.parameters = parts.at(0).split(QLatin1Char(','), Qt::SkipEmptyParts);
+        function.body = parts.at(1);
+        m_engine.functions.insert(it.key(), function);
+    }
 
-    if (m_errored || m_justEvaluated)
-        pressClear();
-    m_entry = formatNumber(value);
-    emit calculationChanged();
+    const int count = settings.beginReadArray(QStringLiteral("history"));
+    for (int k = 0; k < count; ++k) {
+        settings.setArrayIndex(k);
+        HistoryEntry entry;
+        entry.expression = settings.value(QStringLiteral("expression")).toString();
+        entry.value = complexFromString(settings.value(QStringLiteral("value")).toString());
+        entry.definedFunction = settings.value(QStringLiteral("defined")).toString();
+        if (!entry.expression.isEmpty())
+            m_history << entry;
+    }
+    settings.endArray();
+}
+
+void Backend::saveModes() const {
+    QSettings settings;
+    settings.beginGroup(QStringLiteral("calculator"));
+    settings.setValue(QStringLiteral("angle"), angleMode());
+    settings.setValue(QStringLiteral("notation"), notation());
+    settings.setValue(QStringLiteral("base"), base());
+    settings.setValue(QStringLiteral("polar"), m_options.polar);
+}
+
+void Backend::saveState() const {
+    saveModes();
+    QSettings settings;
+    settings.beginGroup(QStringLiteral("calculator"));
+    settings.setValue(QStringLiteral("ans"), complexToString(m_engine.ans));
+
+    QVariantMap variables;
+    for (auto it = m_engine.variables.cbegin(); it != m_engine.variables.cend(); ++it)
+        variables.insert(it.key(), complexToString(it.value()));
+    settings.setValue(QStringLiteral("variables"), variables);
+
+    QVariantMap functions;
+    for (auto it = m_engine.functions.cbegin(); it != m_engine.functions.cend(); ++it) {
+        functions.insert(it.key(), QStringList{it.value().parameters.join(QLatin1Char(',')),
+                                               it.value().body});
+    }
+    settings.setValue(QStringLiteral("functions"), functions);
+
+    settings.remove(QStringLiteral("history"));
+    settings.beginWriteArray(QStringLiteral("history"), m_history.size());
+    for (int k = 0; k < m_history.size(); ++k) {
+        settings.setArrayIndex(k);
+        settings.setValue(QStringLiteral("expression"), m_history.at(k).expression);
+        settings.setValue(QStringLiteral("value"), complexToString(m_history.at(k).value));
+        if (!m_history.at(k).definedFunction.isEmpty())
+            settings.setValue(QStringLiteral("defined"), m_history.at(k).definedFunction);
+    }
+    settings.endArray();
 }
 
 QVariantMap Backend::windowGeometry() const {
