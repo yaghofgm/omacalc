@@ -2,12 +2,36 @@
 
 An engineering calculator built with Qt Quick and C++ that automatically follows the Omarchy theme and system dark/light mode.
 
-<img width="800" alt="Omacalc with the Tokyo Night theme" src="screenshots/omacalc.png" />
+This is an engineering edition of [omacom-io/omacalc](https://github.com/omacom-io/omacalc),
+the dead-simple calculator that ships with Omarchy. It keeps the look and the
+theme integration and adds a full expression engine.
+
+<img width="800" alt="Omacalc engineering edition" src="screenshots/omacalc.png" />
 
 
 ## Install
 
-Install via the Omarchy Package Repository via the `omacalc` package.
+Build from source (the `omacalc` package in the Omarchy repository installs the
+original, simple calculator):
+
+```sh
+sudo pacman -S --needed base-devel qt6-base qt6-declarative
+git clone https://github.com/yaghofgm/omacalc-engineering
+cd omacalc-engineering
+bin/build            # produces build/omacalc
+bin/test             # optional: runs the test suite
+```
+
+To make it the calculator your launcher and Omarchy's calculator keys open,
+install it into `/usr/local/bin`, which comes before `/usr/bin` on the path:
+
+```sh
+sudo install -Dm755 build/omacalc /usr/local/bin/omacalc
+```
+
+This leaves the packaged `/usr/bin/omacalc` alone; remove
+`/usr/local/bin/omacalc` to go back to it. Rebuild and re-run the install line
+to update.
 
 ## Usage
 
